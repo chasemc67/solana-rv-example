@@ -1,0 +1,30 @@
+[package]
+name = "remote_viewing_verifier"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+solana-program = "1.18"
+borsh = "0.10"
+borsh-derive = "0.10"
+thiserror = "1.0"
+bs58 = "0.4"
+
+[dev-dependencies]
+solana-program-test = "1.18"
+solana-sdk = "1.18"
+tokio = { version = "1", features = ["macros"] }
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+no-entrypoint = []
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.release.build-override]
+opt-level = 3
