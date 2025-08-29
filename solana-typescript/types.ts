@@ -21,6 +21,7 @@ export interface Session {
   submittedAt: number;
   finalized: boolean;
   finalizedAt: number;
+  completedTargetIndices: number[];
 }
 
 export interface CreatePoolResult {
@@ -58,6 +59,7 @@ export interface SessionData {
   finalized: boolean;
   finalizedAt: number;
   sessionPDA: string;
+  completedTargetIndices: number[];
 }
 
 export interface PoolData {
@@ -67,6 +69,7 @@ export interface PoolData {
   targets: string[];
   createdAt: number;
   poolPDA: string;
+  finalized: boolean;
 }
 
 export interface RemoteViewingConfig {

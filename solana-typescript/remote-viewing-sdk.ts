@@ -24,6 +24,8 @@ enum InstructionType {
   CreateTargetPool = 0,
   SubmitSession = 1,
   FinalizeSession = 2,
+  AppendTargetsToPool = 3,
+  FinalizePool = 4,
 }
 
 // Define the schema for Borsh serialization matching Rust enum structure
@@ -42,27 +44,54 @@ class SubmitSessionInstruction {
   pool_id: string;
   session_media_hash: Uint8Array;
   target_selector_program: Uint8Array;
+  completed_target_indices: number[];
 
   constructor(
     sessionId: string,
     poolId: string,
     sessionMediaHash: Uint8Array,
     targetSelectorProgram: PublicKey,
+    completedTargetIndices: number[],
   ) {
     this.session_id = sessionId;
     this.pool_id = poolId;
     this.session_media_hash = sessionMediaHash;
     this.target_selector_program = targetSelectorProgram.toBuffer();
+    this.completed_target_indices = completedTargetIndices;
   }
 }
 
 class FinalizeSessionInstruction {
   session_id: string;
   submission_blockhash: string; // Changed to base58 string
+  completed_target_indices: number[];
 
-  constructor(sessionId: string, submissionBlockhashBase58: string) {
+  constructor(
+    sessionId: string,
+    submissionBlockhashBase58: string,
+    completedTargetIndices: number[],
+  ) {
     this.session_id = sessionId;
     this.submission_blockhash = submissionBlockhashBase58;
+    this.completed_target_indices = completedTargetIndices;
+  }
+}
+
+class AppendTargetsToPoolInstruction {
+  pool_id: string;
+  target_hashes: Uint8Array[];
+
+  constructor(poolId: string, targetHashes: string[]) {
+    this.pool_id = poolId;
+    this.target_hashes = targetHashes.map(hash => Buffer.from(hash, 'hex'));
+  }
+}
+
+class FinalizePoolInstruction {
+  pool_id: string;
+
+  constructor(poolId: string) {
+    this.pool_id = poolId;
   }
 }
 
@@ -90,6 +119,7 @@ const SUBMIT_SESSION_SCHEMA = new Map([
         ['pool_id', 'string'],
         ['session_media_hash', ['u8', 32]],
         ['target_selector_program', ['u8', 32]],
+        ['completed_target_indices', ['u16']],
       ],
     },
   ],
@@ -103,7 +133,31 @@ const FINALIZE_SESSION_SCHEMA = new Map([
       fields: [
         ['session_id', 'string'],
         ['submission_blockhash', 'string'], // Changed to string for base58
+        ['completed_target_indices', ['u16']],
       ],
+    },
+  ],
+]);
+
+const APPEND_TARGETS_SCHEMA = new Map([
+  [
+    AppendTargetsToPoolInstruction,
+    {
+      kind: 'struct',
+      fields: [
+        ['pool_id', 'string'],
+        ['target_hashes', [['u8', 32]]],
+      ],
+    },
+  ],
+]);
+
+const FINALIZE_POOL_SCHEMA = new Map([
+  [
+    FinalizePoolInstruction,
+    {
+      kind: 'struct',
+      fields: [['pool_id', 'string']],
     },
   ],
 ]);
@@ -121,6 +175,7 @@ class SessionAccount {
   submitted_at: bigint = BigInt(0);
   finalized: boolean = false;
   finalized_at: bigint = BigInt(0);
+  completed_target_indices: number[] = [];
 }
 
 class PoolAccount {
@@ -129,6 +184,7 @@ class PoolAccount {
   target_count: number = 0;
   targets: Uint8Array[] = [];
   created_at: bigint = BigInt(0);
+  finalized: boolean = false;
 }
 
 // Manual deserialization functions
@@ -186,6 +242,15 @@ function deserializeSessionAccount(data: Buffer): SessionAccount {
   const finalized_at = view.getBigInt64(offset, true);
   offset += 8;
 
+  // Read completed_target_indices (Vec<u16>: 4-byte length + u16 elements)
+  const completedIndicesLen = view.getUint32(offset, true);
+  offset += 4;
+  const completed_target_indices: number[] = [];
+  for (let i = 0; i < completedIndicesLen; i++) {
+    completed_target_indices.push(view.getUint16(offset, true));
+    offset += 2;
+  }
+
   const account = new SessionAccount();
   account.session_id = session_id;
   account.pool_id = pool_id;
@@ -198,6 +263,7 @@ function deserializeSessionAccount(data: Buffer): SessionAccount {
   account.submitted_at = submitted_at;
   account.finalized = finalized;
   account.finalized_at = finalized_at;
+  account.completed_target_indices = completed_target_indices;
 
   return account;
 }
@@ -233,12 +299,17 @@ function deserializePoolAccount(data: Buffer): PoolAccount {
   const created_at = view.getBigInt64(offset, true);
   offset += 8;
 
+  // Read finalized (bool - 1 byte)
+  const finalized = data[offset] !== 0;
+  offset += 1;
+
   const account = new PoolAccount();
   account.pool_id = pool_id;
   account.creator = creator;
   account.target_count = target_count;
   account.targets = targets;
   account.created_at = created_at;
+  account.finalized = finalized;
 
   return account;
 }
@@ -284,6 +355,24 @@ export class RemoteViewingSDK {
       throw new Error('Target hashes cannot be empty');
     }
 
+    // Solana transaction size limit - can fit roughly 30-35 hashes per transaction
+    const MAX_HASHES_PER_TRANSACTION = 25;
+
+    if (targetHashes.length <= MAX_HASHES_PER_TRANSACTION) {
+      // Single pool - use existing logic
+      return this.createSinglePool(targetHashes);
+    } else {
+      // Multiple pools needed - use append logic for large pools
+      return this.createPoolWithAppends(
+        targetHashes,
+        MAX_HASHES_PER_TRANSACTION,
+      );
+    }
+  }
+
+  private async createSinglePool(
+    targetHashes: string[],
+  ): Promise<CreatePoolResult> {
     if (targetHashes.length > 10000) {
       throw new Error('Too many target hashes (max 10000)');
     }
@@ -359,10 +448,262 @@ export class RemoteViewingSDK {
     }
   }
 
+  private async createPoolWithAppends(
+    targetHashes: string[],
+    batchSize: number,
+  ): Promise<CreatePoolResult> {
+    const poolId = `pool_${Date.now()}`;
+
+    console.log(
+      `Creating pool with appends for ${targetHashes.length} targets with batch size ${batchSize}`,
+    );
+
+    // Split targets into batches
+    const batches: string[][] = [];
+    for (let i = 0; i < targetHashes.length; i += batchSize) {
+      batches.push(targetHashes.slice(i, i + batchSize));
+    }
+
+    console.log(
+      `Will create initial pool + ${batches.length - 1} append operations`,
+    );
+
+    const allSignatures: string[] = [];
+
+    // Create initial pool with first batch
+    const firstBatch = batches[0];
+    console.log(`Creating initial pool with ${firstBatch.length} targets`);
+
+    const createResult = await this.createSinglePoolWithId(poolId, firstBatch);
+    allSignatures.push(createResult.signature);
+
+    // Append remaining batches
+    for (let i = 1; i < batches.length; i++) {
+      const batch = batches[i];
+      console.log(
+        `Appending batch ${i}/${batches.length - 1}: ${batch.length} targets`,
+      );
+
+      try {
+        const appendResult = await this.appendTargetsToPool(poolId, batch);
+        allSignatures.push(appendResult.signature);
+
+        // Small delay between transactions to avoid rate limiting
+        if (i < batches.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      } catch (error) {
+        console.error(`Failed to append batch ${i}: ${error}`);
+        throw new Error(`Failed to append batch ${i}: ${error}`);
+      }
+    }
+
+    // Finalize the pool
+    console.log(`Finalizing pool ${poolId}`);
+    const finalizeResult = await this.finalizePool(poolId);
+    allSignatures.push(finalizeResult.signature);
+
+    console.log(
+      `Successfully created pool ${poolId} with ${targetHashes.length} targets across ${batches.length} transactions`,
+    );
+
+    return {
+      poolId,
+      address: createResult.address,
+      signature: allSignatures.join(','),
+      explorerUrl: createResult.explorerUrl,
+    };
+  }
+
+  private async createSinglePoolWithId(
+    poolId: string,
+    targetHashes: string[],
+  ): Promise<CreatePoolResult> {
+    // Validate all hashes are 32 bytes hex strings
+    for (const hash of targetHashes) {
+      if (!/^[0-9a-fA-F]{64}$/.test(hash)) {
+        throw new Error(
+          `Invalid hash format: ${hash} (must be 32 bytes hex string)`,
+        );
+      }
+    }
+
+    const poolPDA = await this.getPoolPDA(poolId);
+
+    try {
+      // Create instruction data
+      const instructionData = this.encodeCreatePoolInstruction(
+        poolId,
+        targetHashes,
+      );
+
+      // Build instruction
+      const instruction = new TransactionInstruction({
+        programId: this.programId,
+        keys: [
+          { pubkey: poolPDA, isSigner: false, isWritable: true },
+          { pubkey: this.payer.publicKey, isSigner: true, isWritable: true },
+          {
+            pubkey: SystemProgram.programId,
+            isSigner: false,
+            isWritable: false,
+          },
+        ],
+        data: instructionData,
+      });
+
+      // Create and send transaction with retry logic
+      const transaction = new Transaction().add(instruction);
+
+      const signature = await this.sendTransactionWithRetry(transaction, [
+        this.payer,
+      ]);
+
+      console.log(`Sub-pool creation transaction sent: ${signature}`);
+
+      // Generate explorer URL using helper method
+      const explorerUrl = this.getExplorerUrl('tx', signature);
+
+      return {
+        poolId,
+        address: poolPDA.toBase58(),
+        signature,
+        explorerUrl,
+      };
+    } catch (error) {
+      console.error(`Error creating sub-pool ${poolId}:`, error);
+      throw error;
+    }
+  }
+
+  async appendTargetsToPool(
+    poolId: string,
+    targetHashes: string[],
+  ): Promise<CreatePoolResult> {
+    // Validate input parameters
+    if (!poolId || poolId.trim() === '') {
+      throw new Error('Pool ID cannot be empty');
+    }
+
+    if (!targetHashes || targetHashes.length === 0) {
+      throw new Error('Target hashes cannot be empty');
+    }
+
+    // Validate all hashes are 32 bytes hex strings
+    for (const hash of targetHashes) {
+      if (!/^[0-9a-fA-F]{64}$/.test(hash)) {
+        throw new Error(
+          `Invalid hash format: ${hash} (must be 32 bytes hex string)`,
+        );
+      }
+    }
+
+    const poolPDA = await this.getPoolPDA(poolId);
+
+    console.log('Appending targets to pool:', poolId);
+    console.log('Pool PDA:', poolPDA.toBase58());
+    console.log('Target hashes to append:', targetHashes.length);
+
+    try {
+      // Create instruction data
+      const instructionData = this.encodeAppendTargetsInstruction(
+        poolId,
+        targetHashes,
+      );
+
+      // Build instruction
+      const instruction = new TransactionInstruction({
+        programId: this.programId,
+        keys: [
+          { pubkey: poolPDA, isSigner: false, isWritable: true },
+          { pubkey: this.payer.publicKey, isSigner: true, isWritable: true },
+          {
+            pubkey: SystemProgram.programId,
+            isSigner: false,
+            isWritable: false,
+          },
+        ],
+        data: instructionData,
+      });
+
+      // Create and send transaction with retry logic
+      const transaction = new Transaction().add(instruction);
+
+      const signature = await this.sendTransactionWithRetry(transaction, [
+        this.payer,
+      ]);
+
+      console.log(`Append targets transaction sent: ${signature}`);
+
+      // Generate explorer URL using helper method
+      const explorerUrl = this.getExplorerUrl('tx', signature);
+
+      return {
+        poolId,
+        address: poolPDA.toBase58(),
+        signature,
+        explorerUrl,
+      };
+    } catch (error) {
+      console.error(`Error appending targets to pool ${poolId}:`, error);
+      throw error;
+    }
+  }
+
+  async finalizePool(poolId: string): Promise<CreatePoolResult> {
+    // Validate input parameters
+    if (!poolId || poolId.trim() === '') {
+      throw new Error('Pool ID cannot be empty');
+    }
+
+    const poolPDA = await this.getPoolPDA(poolId);
+
+    console.log('Finalizing pool:', poolId);
+    console.log('Pool PDA:', poolPDA.toBase58());
+
+    try {
+      // Create instruction data
+      const instructionData = this.encodeFinalizePoolInstruction(poolId);
+
+      // Build instruction
+      const instruction = new TransactionInstruction({
+        programId: this.programId,
+        keys: [
+          { pubkey: poolPDA, isSigner: false, isWritable: true },
+          { pubkey: this.payer.publicKey, isSigner: true, isWritable: true },
+        ],
+        data: instructionData,
+      });
+
+      // Create and send transaction with retry logic
+      const transaction = new Transaction().add(instruction);
+
+      const signature = await this.sendTransactionWithRetry(transaction, [
+        this.payer,
+      ]);
+
+      console.log(`Finalize pool transaction sent: ${signature}`);
+
+      // Generate explorer URL using helper method
+      const explorerUrl = this.getExplorerUrl('tx', signature);
+
+      return {
+        poolId,
+        address: poolPDA.toBase58(),
+        signature,
+        explorerUrl,
+      };
+    } catch (error) {
+      console.error(`Error finalizing pool ${poolId}:`, error);
+      throw error;
+    }
+  }
+
   async submitSession(
     sessionId: string,
     poolId: string,
     sessionMediaHash: string,
+    completedTargetIndices: number[] = [],
   ): Promise<SubmitSessionResult> {
     // Validate input parameters
     if (!sessionId || sessionId.trim() === '') {
@@ -397,6 +738,7 @@ export class RemoteViewingSDK {
         poolId,
         mediaHashBytes,
         this.programId, // Using program ID as target selector for now
+        completedTargetIndices,
       );
 
       // Build instruction
@@ -425,18 +767,9 @@ export class RemoteViewingSDK {
 
       console.log('Session submission transaction sent:', signature);
 
-      // Get the actual slot from the confirmed transaction to fix race condition
-      const txInfo = await this.connection.getTransaction(signature, {
-        commitment: 'confirmed',
-        maxSupportedTransactionVersion: 0,
-      });
-
-      const actualSubmissionSlot = txInfo?.slot;
-      if (!actualSubmissionSlot) {
-        throw new Error(
-          'Could not retrieve actual submission slot from transaction',
-        );
-      }
+      // Get the actual slot from the confirmed transaction with retry logic
+      const actualSubmissionSlot =
+        await this.getTransactionSlotWithRetry(signature);
 
       // Generate explorer URLs using helper method
       const txExplorerUrl = this.getExplorerUrl('tx', signature);
@@ -465,6 +798,7 @@ export class RemoteViewingSDK {
   async finalizeSession(
     sessionId: string,
     poolId: string,
+    completedTargetIndices: number[] = [],
   ): Promise<FinalizeSessionResult> {
     const sessionPDA = await this.getSessionPDA(sessionId);
     const poolPDA = await this.getPoolPDA(poolId);
@@ -526,6 +860,7 @@ export class RemoteViewingSDK {
       const instructionData = this.encodeFinalizeSessionInstruction(
         sessionId,
         submissionBlockhashBase58,
+        completedTargetIndices,
       );
 
       // Build instruction (removed SYSVAR_SLOT_HASHES_PUBKEY)
@@ -550,11 +885,12 @@ export class RemoteViewingSDK {
 
       console.log('Session finalization transaction sent:', signature);
 
-      // Calculate the target assignment using the submission blockhash (in base58)
-      const { targetHash, targetIndex } = await this.getTargetForSession(
-        submissionBlockhashBase58,
-        poolId,
-      );
+      // Read the actual assigned target from the blockchain after finalization with retry logic
+      const finalizedSessionData =
+        await this.getSessionWithTargetHashWithRetry(sessionId);
+      if (!finalizedSessionData || !finalizedSessionData.finalized) {
+        throw new Error('Session was not properly finalized');
+      }
 
       // Generate explorer URL using helper method
       const explorerUrl = this.getExplorerUrl('tx', signature);
@@ -563,8 +899,8 @@ export class RemoteViewingSDK {
       return {
         transactionSignature: signature,
         blockHash: submissionBlockhashBase58, // Return base58 format
-        assignedTargetHash: targetHash,
-        assignedTargetIndex: targetIndex,
+        assignedTargetHash: finalizedSessionData.assignedTargetHash || '',
+        assignedTargetIndex: finalizedSessionData.assignedTargetIndex,
         explorerUrl,
       };
     } catch (error) {
@@ -573,20 +909,25 @@ export class RemoteViewingSDK {
     }
   }
 
+  /**
+   * Get the target that was actually assigned to a session (reads from blockchain)
+   * This should be used for verification and displaying actual results
+   */
   async getTargetForSession(
-    blockHashBase58: string,
-    poolId: string,
-  ): Promise<{ targetHash: string; targetIndex: number }> {
-    // Get the actual pool data from the blockchain
-    const poolData = await this.getPoolData(poolId);
-    if (!poolData) {
-      throw new Error(`Pool ${poolId} not found`);
+    sessionId: string,
+  ): Promise<{ targetHash: string; targetIndex: number } | null> {
+    const sessionData = await this.getSessionWithTargetHash(sessionId);
+    if (
+      !sessionData ||
+      !sessionData.finalized ||
+      !sessionData.assignedTargetHash
+    ) {
+      return null;
     }
 
-    const index = this.hashToIndex(blockHashBase58, poolData.targets.length);
     return {
-      targetHash: poolData.targets[index],
-      targetIndex: index,
+      targetHash: sessionData.assignedTargetHash,
+      targetIndex: sessionData.assignedTargetIndex,
     };
   }
 
@@ -647,6 +988,121 @@ export class RemoteViewingSDK {
     );
   }
 
+  private async getTransactionSlotWithRetry(
+    signature: string,
+    maxRetries: number = 5,
+    initialDelay: number = 500,
+  ): Promise<number> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        console.log(
+          `Attempting to retrieve transaction slot (attempt ${attempt + 1}/${maxRetries})`,
+        );
+
+        const txInfo = await this.connection.getTransaction(signature, {
+          commitment: 'confirmed',
+          maxSupportedTransactionVersion: 0,
+        });
+
+        if (txInfo?.slot) {
+          console.log(`Successfully retrieved slot: ${txInfo.slot}`);
+          return txInfo.slot;
+        }
+
+        // If we got a response but no slot, that's concerning
+        if (txInfo) {
+          console.warn('Transaction found but missing slot information');
+        } else {
+          console.warn('Transaction not found in getTransaction response');
+        }
+
+        throw new Error('Transaction slot not available');
+      } catch (error) {
+        lastError = error as Error;
+        console.warn(`Slot retrieval attempt ${attempt + 1} failed:`, error);
+
+        if (attempt < maxRetries - 1) {
+          const delay = initialDelay * Math.pow(1.5, attempt); // Gentler exponential backoff
+          console.log(`Retrying slot retrieval in ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+    }
+
+    // If all retries failed, try one more time with 'finalized' commitment
+    console.log('Attempting final slot retrieval with finalized commitment...');
+    try {
+      const txInfo = await this.connection.getTransaction(signature, {
+        commitment: 'finalized',
+        maxSupportedTransactionVersion: 0,
+      });
+
+      if (txInfo?.slot) {
+        console.log(`Retrieved slot with finalized commitment: ${txInfo.slot}`);
+        return txInfo.slot;
+      }
+    } catch (finalError) {
+      console.warn(
+        'Final attempt with finalized commitment also failed:',
+        finalError,
+      );
+    }
+
+    throw new Error(
+      `Could not retrieve actual submission slot from transaction after ${maxRetries} attempts: ${lastError?.message || 'Unknown error'}`,
+    );
+  }
+
+  private async getSessionWithTargetHashWithRetry(
+    sessionId: string,
+    maxRetries: number = 5,
+    initialDelay: number = 500,
+  ): Promise<(SessionData & { assignedTargetHash?: string }) | null> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        console.log(
+          `Attempting to retrieve finalized session data (attempt ${attempt + 1}/${maxRetries})`,
+        );
+
+        const sessionData = await this.getSessionWithTargetHash(sessionId);
+        
+        if (sessionData && sessionData.finalized) {
+          console.log(`Successfully retrieved finalized session data`);
+          return sessionData;
+        }
+
+        // If we got session data but it's not finalized yet
+        if (sessionData) {
+          console.warn('Session found but not yet finalized');
+        } else {
+          console.warn('Session data not found');
+        }
+
+        throw new Error('Session not yet finalized');
+      } catch (error) {
+        lastError = error as Error;
+        console.warn(
+          `Session data retrieval attempt ${attempt + 1} failed:`,
+          error,
+        );
+
+        if (attempt < maxRetries - 1) {
+          const delay = initialDelay * Math.pow(1.5, attempt); // Gentler exponential backoff
+          console.log(`Retrying session data retrieval in ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+    }
+
+    throw new Error(
+      `Could not retrieve finalized session data after ${maxRetries} attempts: ${lastError?.message || 'Unknown error'}`,
+    );
+  }
+
   private async getPoolPDA(poolId: string): Promise<PublicKey> {
     // Hash the poolId to ensure it fits within the 32-byte seed limit
     const poolIdHash = createHash('sha256').update(poolId).digest();
@@ -694,12 +1150,14 @@ export class RemoteViewingSDK {
     poolId: string,
     sessionMediaHash: Uint8Array,
     targetSelectorProgram: PublicKey,
+    completedTargetIndices: number[],
   ): Buffer {
     const instruction = new SubmitSessionInstruction(
       sessionId,
       poolId,
       sessionMediaHash,
       targetSelectorProgram,
+      completedTargetIndices,
     );
     const data = borsh.serialize(SUBMIT_SESSION_SCHEMA, instruction);
     // Prepend the enum variant discriminator (1 for SubmitSession)
@@ -712,15 +1170,43 @@ export class RemoteViewingSDK {
   private encodeFinalizeSessionInstruction(
     sessionId: string,
     submissionBlockhashBase58: string,
+    completedTargetIndices: number[],
   ): Buffer {
     const instruction = new FinalizeSessionInstruction(
       sessionId,
       submissionBlockhashBase58,
+      completedTargetIndices,
     );
     const data = borsh.serialize(FINALIZE_SESSION_SCHEMA, instruction);
     // Prepend the enum variant discriminator (2 for FinalizeSession)
     return Buffer.concat([
       Buffer.from([InstructionType.FinalizeSession]),
+      Buffer.from(data),
+    ]);
+  }
+
+  private encodeAppendTargetsInstruction(
+    poolId: string,
+    targetHashes: string[],
+  ): Buffer {
+    const instruction = new AppendTargetsToPoolInstruction(
+      poolId,
+      targetHashes,
+    );
+    const data = borsh.serialize(APPEND_TARGETS_SCHEMA, instruction);
+    // Prepend the enum variant discriminator (3 for AppendTargetsToPool)
+    return Buffer.concat([
+      Buffer.from([InstructionType.AppendTargetsToPool]),
+      Buffer.from(data),
+    ]);
+  }
+
+  private encodeFinalizePoolInstruction(poolId: string): Buffer {
+    const instruction = new FinalizePoolInstruction(poolId);
+    const data = borsh.serialize(FINALIZE_POOL_SCHEMA, instruction);
+    // Prepend the enum variant discriminator (4 for FinalizePool)
+    return Buffer.concat([
+      Buffer.from([InstructionType.FinalizePool]),
       Buffer.from(data),
     ]);
   }
@@ -753,6 +1239,7 @@ export class RemoteViewingSDK {
         finalized: sessionAccount.finalized,
         finalizedAt: Number(sessionAccount.finalized_at),
         sessionPDA: sessionPDA.toBase58(),
+        completedTargetIndices: sessionAccount.completed_target_indices,
       };
     } catch (error) {
       console.error('Error getting session data:', error);
@@ -780,6 +1267,7 @@ export class RemoteViewingSDK {
         ),
         createdAt: Number(poolAccount.created_at),
         poolPDA: poolPDA.toBase58(),
+        finalized: poolAccount.finalized,
       };
     } catch (error) {
       console.error('Error getting pool data:', error);

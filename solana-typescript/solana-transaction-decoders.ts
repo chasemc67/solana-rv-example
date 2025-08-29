@@ -23,6 +23,10 @@ function readUInt32LE(buffer: Uint8Array, offset: number): number {
   ); // Unsigned right shift to ensure positive
 }
 
+function readUInt16LE(buffer: Uint8Array, offset: number): number {
+  return buffer[offset] | (buffer[offset + 1] << 8);
+}
+
 function uint8ArrayToHex(buffer: Uint8Array): string {
   return Array.from(buffer)
     .map(b => b.toString(16).padStart(2, '0'))
@@ -74,6 +78,7 @@ export function decodeSubmitSessionInstruction(hex: string): {
   pool_id: string;
   session_media_hash: string;
   target_selector_program: string;
+  completed_target_indices: number[];
 } {
   try {
     const buffer = hexToUint8Array(hex);
@@ -104,12 +109,21 @@ export function decodeSubmitSessionInstruction(hex: string): {
       buffer.subarray(offset, offset + 32),
     );
     offset += 32;
+    // Completed target indices (Vec<u16>: 4-byte length prefix, then u16 elements)
+    const completedIndicesLen = readUInt32LE(buffer, offset);
+    offset += 4;
+    const completed_target_indices: number[] = [];
+    for (let i = 0; i < completedIndicesLen; i++) {
+      completed_target_indices.push(readUInt16LE(buffer, offset));
+      offset += 2;
+    }
     return {
       instruction,
       session_id,
       pool_id,
       session_media_hash,
       target_selector_program,
+      completed_target_indices,
     };
   } catch (err: unknown) {
     if (err instanceof Error) {
@@ -123,6 +137,7 @@ export function decodeFinalizeSessionInstruction(hex: string): {
   instruction: 2;
   session_id: string;
   submission_blockhash: string;
+  completed_target_indices: number[];
 } {
   try {
     const buffer = hexToUint8Array(hex);
@@ -143,10 +158,19 @@ export function decodeFinalizeSessionInstruction(hex: string): {
       buffer.subarray(offset, offset + blockhashLen),
     );
     offset += blockhashLen;
+    // Completed target indices (Vec<u16>: 4-byte length prefix, then u16 elements)
+    const completedIndicesLen = readUInt32LE(buffer, offset);
+    offset += 4;
+    const completed_target_indices: number[] = [];
+    for (let i = 0; i < completedIndicesLen; i++) {
+      completed_target_indices.push(readUInt16LE(buffer, offset));
+      offset += 2;
+    }
     return {
       instruction,
       session_id,
       submission_blockhash,
+      completed_target_indices,
     };
   } catch (err: unknown) {
     if (err instanceof Error) {
@@ -156,8 +180,82 @@ export function decodeFinalizeSessionInstruction(hex: string): {
   }
 }
 
-// Auto-detect instruction type and decode
-export function decodeInstruction(hex: string):
+// Pool account decoder function
+export function decodePoolAccount(base64Data: string): {
+  type: 'poolAccount';
+  pool_id: string;
+  creator: string;
+  target_count: number;
+  targets: string[];
+  created_at: number;
+  finalized: boolean;
+} {
+  try {
+    // Decode base64 to buffer (browser-compatible)
+    const binaryString = atob(base64Data);
+    const data = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      data[i] = binaryString.charCodeAt(i);
+    }
+    let offset = 0;
+
+    // Read pool_id (string: 4-byte length + utf8 bytes)
+    const poolIdLen = readUInt32LE(data, offset);
+    offset += 4;
+    const pool_id = uint8ArrayToUtf8(data.subarray(offset, offset + poolIdLen));
+    offset += poolIdLen;
+
+    // Read creator (32 bytes)
+    const creator = data.subarray(offset, offset + 32);
+    offset += 32;
+
+    // Read target_count (u16 - 2 bytes)
+    const target_count = readUInt16LE(data, offset);
+    offset += 2;
+
+    // Read targets (Vec<[u8; 32]>: 4-byte length + target_count * 32 bytes)
+    const targetsLen = readUInt32LE(data, offset);
+    offset += 4;
+    const targets: string[] = [];
+    for (let i = 0; i < targetsLen; i++) {
+      const target = data.subarray(offset, offset + 32);
+      targets.push(uint8ArrayToHex(target));
+      offset += 32;
+    }
+
+    // Read created_at (i64 - 8 bytes)
+    // Note: JavaScript doesn't have native i64, so we'll read as two 32-bit values
+    const createdAtLow = readUInt32LE(data, offset);
+    const createdAtHigh = readUInt32LE(data, offset + 4);
+    const created_at = createdAtLow + createdAtHigh * 0x100000000;
+    offset += 8;
+
+    // Read finalized (bool - 1 byte)
+    const finalized = data[offset] !== 0;
+
+    return {
+      type: 'poolAccount' as const,
+      pool_id,
+      creator: uint8ArrayToHex(creator),
+      target_count,
+      targets,
+      created_at,
+      finalized,
+    };
+  } catch (error) {
+    throw new Error(`Failed to decode pool account: ${error}`);
+  }
+}
+
+// Helper function to detect if string is likely base64
+function isLikelyBase64(str: string): boolean {
+  // Base64 regex pattern
+  const base64Pattern = /^[A-Za-z0-9+/]*={0,2}$/;
+  return base64Pattern.test(str) && str.length > 50; // Pool account data should be fairly long
+}
+
+// Auto-detect data type and decode (hex instruction or base64 pool account)
+export function decodeInstruction(input: string):
   | { instruction: 0; pool_id: string; target_hashes: string[] }
   | {
       instruction: 1;
@@ -165,18 +263,56 @@ export function decodeInstruction(hex: string):
       pool_id: string;
       session_media_hash: string;
       target_selector_program: string;
+      completed_target_indices: number[];
     }
-  | { instruction: 2; session_id: string; submission_blockhash: string } {
-  const buffer = hexToUint8Array(hex);
-  const instructionByte = readUInt8(buffer, 0);
+  | {
+      instruction: 2;
+      session_id: string;
+      submission_blockhash: string;
+      completed_target_indices: number[];
+    }
+  | {
+      type: 'poolAccount';
+      pool_id: string;
+      creator: string;
+      target_count: number;
+      targets: string[];
+      created_at: number;
+      finalized: boolean;
+    } {
+  // First, try to detect if this looks like base64 pool account data
+  if (isLikelyBase64(input)) {
+    try {
+      return decodePoolAccount(input);
+    } catch {
+      // If base64 decode fails, fall through to hex instruction decode
+    }
+  }
 
-  if (instructionByte === 0) {
-    return decodeCreateTargetPoolInstruction(hex);
-  } else if (instructionByte === 1) {
-    return decodeSubmitSessionInstruction(hex);
-  } else if (instructionByte === 2) {
-    return decodeFinalizeSessionInstruction(hex);
-  } else {
-    throw new Error(`Unknown instruction type: ${instructionByte}`);
+  // Try to decode as hex instruction
+  try {
+    const buffer = hexToUint8Array(input);
+    const instructionByte = readUInt8(buffer, 0);
+
+    if (instructionByte === 0) {
+      return decodeCreateTargetPoolInstruction(input);
+    } else if (instructionByte === 1) {
+      return decodeSubmitSessionInstruction(input);
+    } else if (instructionByte === 2) {
+      return decodeFinalizeSessionInstruction(input);
+    } else {
+      throw new Error(`Unknown instruction type: ${instructionByte}`);
+    }
+  } catch (hexError) {
+    // If both base64 and hex failed, provide a helpful error
+    if (isLikelyBase64(input)) {
+      throw new Error(
+        'Failed to decode as both pool account data and hex instruction. Data may be corrupted.',
+      );
+    } else {
+      throw new Error(
+        `Failed to decode hex instruction: ${hexError instanceof Error ? hexError.message : 'Unknown error'}`,
+      );
+    }
   }
 }
